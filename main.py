@@ -26,6 +26,8 @@ def get_args():
     psr.add_argument("--prev-games", type=int, help="# of games previously played.", default=25)
     psr.add_argument("--opp-ratings", type=float, required=True, nargs='+', help="List of opponeng ratings.")
     psr.add_argument("--score", type=float, required=True, help="Your tournament score. Must be a multiple of 0.5.")
+    psr.add_argument("--all-wins", action='store_true', help="Flag for denoting if all previous games were wins for player. Only used for provisional rating calculations at or under 8 games.")
+    psr.add_argument("--all-losses", action='store_true', help="Flag for denoting if all previous games were losses for player. Only used for provisional rating calculations at or under 8 games.")
     return psr.parse_args()
 
 def validate(args):
@@ -33,7 +35,7 @@ def validate(args):
         raise ValueError("Score must be non-negative.")
     if args.score * 2 != int(args.score * 2):
         raise ValueError("Score must be a multiple of 0.5 (loss=0, draw=0.5, win=1).")
-    if args.prev_games > 0 and args.curr_rating < USCF_FLOOR:
+    if args.prev_games > 0 and 0 < args.curr_rating < USCF_FLOOR:
         raise ValueError("Your rating must be above the USCF floor of 100.")
     if any(map(partial(op.gt, USCF_FLOOR), args.opp_ratings)):
         raise ValueError("All opponent ratings must be above the USCF floor of 100.")
@@ -41,6 +43,8 @@ def validate(args):
         raise ValueError("Must have played a positive number of games.")
     if args.prev_games < 8:
         warnings.warn("Rating calculation may be inaccurate for provisional ratings under 8 games.", RuntimeWarning)
+    if args.all_wins and args.all_losses:
+        raise ValueError("Player cannot have both won and lost all games.")
     if args.curr_rating == 0:
         if args.prev_games > 0:
             raise ValueError("Cannot have a null rating with games played.")
@@ -86,11 +90,91 @@ def find_performance_rating(init, opps, score, tol=1e-3):
         curr_guess -= diff
     return curr_guess
 
-def compute_special_rating(rating, opps, score, prev_games):
-    pwe = np.clip((rating - opps) / 800 + 0.5, 0, 1)
+def provisional_winning_expectancy(rating, opp_array):
+    return np.clip((rating - np.array(opp_array)) / 800 + 0.5, 0, 1)
+
+
+def provisional_approximate_newton(curr_m, loss_at_m, z, loss_at_z):
+    return curr_m - loss_at_m * (z - curr_m) / (loss_at_z - loss_at_m)
+
+def compute_special_rating(rating, opps, score, prev_games, all_wins=False, all_losses=False, provisional_convergence_eps=1e-7):
+    """
+        Provisional rating calculation for players with <= 8 games.
+
+        Given a calculated "adjusted rating" r', adjusted score s', and # of effective games n',
+        a player's rating R is given as the zero of the function
+
+        f(R) = n' * pwe(rating, adj_rating) + sum_i pwe(rating, opp_i_rating) - s',
+
+        which is stated to be "the difference between the sum of provisional winning expectancies
+        and the actual attianed score when a player is rated R." Unsure how this actually maps on to
+        the function.
+
+        f(R) essentially becomes the sum of hard-thresholded linear functions, which becomes a piecewise-linear
+        approximation of an S-shaped function when plotted in 2D. The document specifies an approximate
+        Newton's method for root-finding before constraining the final rating estimate to a particular rating
+        range determined by opponent ratings upon reaching the algorithm tolerance limit.
+
+    """
+    pwe = provisional_winning_expectancy(rating, opps)
     effective_games = calculate_effective_games(rating, prev_games)
-    k = compute_k_numerator(rating) / (effective_games + len(opps))
-    #  TODO: finish this
+    adj_rating = rating
+    adj_score = score + effective_games / 2
+    if all_wins:
+        adj_rating = rating - 400
+        adj_score = score + effective_games
+    if all_losses:
+        adj_rating = rating + 400
+        adj_score = score
+    temp_arr = np.array([adj_rating] + opps)
+    sz = np.sort(np.concatenate([temp_arr - 400, temp_arr + 400]))
+    m = (effective_games * adj_rating + sum(opps) + 400 * (2 * score - len(opps))) / (effective_games + len(opps)) # this initialization is an initial rating guess -- convergence is faster according to the spec, but results shouldn't change
+    def evaluate_provisional_objective(r):
+        return effective_games * provisional_winning_expectancy(r, adj_rating) + provisional_winning_expectancy(r, opps).sum() - adj_score
+
+    while True:
+        loss_at_m = evaluate_provisional_objective(m)
+        if loss_at_m > provisional_convergence_eps: # we've overshot 
+            # find the largest (wrt R) "kink" in f(R) that the rating guess m exceeds (lower bound)
+            za = sz[np.searchsorted(sz, m, side='left') - 1]
+            loss_at_za = evaluate_provisional_objective(za)
+            if abs(loss_at_m - loss_at_za) < provisional_convergence_eps:
+                m = za
+                continue # if m is already close to the "kink" location, then the new guess is the "kink" location -- in the next iteration we'll search one "kink" to the left (i.e., closer to 0)
+            else:
+                # otherwise, run one approximate Newton iteration, capped by the kink to the left (don't want to overshoot)     
+                m_update = provisional_approximate_newton(m, loss_at_m, za, loss_at_za) 
+                if m_update < za:
+                    m = za
+                else: # za< m_update < m:
+                    m = m_update
+        elif loss_at_m < -provisional_convergence_eps: # we've undershot
+            # find the smallest (wrt  R) "kink" in f(R) that the rating guess m is below (upper bound)
+
+            zb = sz[np.searchsorted(sz, m, side='right')]
+            loss_at_zb = evaluate_provisional_objective(zb)
+            if abs(loss_at_m -  loss_at_zb) < provisional_convergence_eps:
+                m  = zb
+                continue
+            else:
+                m_update = provisional_approximate_newton(m, loss_at_m, zb, loss_at_zb)
+                if m_update > zb:
+                    m = zb
+                    continue
+                else: # m < m_update < zb
+                    m = m_update
+        else: # |f(M)| < eps
+            p = np.count_nonzero(np.abs(m - np.array(opps)) <= 400) + (np.abs(m - adj_rating) <= 400)
+            # unsure why there's special handling here. If f(M) is near 0, why not just take the iterate as 
+            # the rating? Why clamp it to z_a, z_b only for cases where there are no opponent ratings near
+            # (i.e. within 400) of candidate rating?
+            if p == 0:
+                za = sz[np.searchsorted(sz, m, side='left') - 1] # there is a typo on pg. 10 of the rating doc. in the definition of z_a. I assume this is the definition.
+                zb = sz[np.searchsorted(sz, m, side='left')]
+                # za < M < zb
+                m = np.clip(rating, za, zb)
+            break
+        return min(2700, m)
 
 
 def compute_new_rating(rating, opps, score, prev_games):
@@ -169,7 +253,10 @@ def print_results(performance, score, we, curr_rating, new_rating, norms_table, 
 if __name__ == '__main__':
     args = get_args()
     validate(args)
-    new_rating = compute_new_rating(args.curr_rating, args.opp_ratings, args.score, args.prev_games)
+    if args.prev_games < 8:
+        new_rating = compute_special_rating(args.curr_rating, args.opp_ratings, args.score, args.prev_games, all_wins=args.all_wins, all_losses=args.all_losses)
+    else:
+        new_rating = compute_new_rating(args.curr_rating, args.opp_ratings, args.score, args.prev_games)
     we = get_expected_wins(args.curr_rating, args.opp_ratings).sum()
     tpr = find_performance_rating(new_rating, args.opp_ratings, args.score)
     norms_table = get_norms(args.curr_rating, args.opp_ratings, args.score)
