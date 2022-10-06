@@ -59,4 +59,4 @@ This is much simpler than it looks -- we simply calculate the expected results i
 
 ## Limitations
 
-May not work with provisional ratings as well, since a special rating formula is used for computing those.  
+The rating delta tends to be off by a few points -- norm results match my own, but I've yet to replicate USCF's results from my games.
